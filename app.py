@@ -63,6 +63,11 @@ class ImageExtractor(HTMLParser):
                 content = attr_map.get("content")
                 if content:
                     self.links.append((urljoin(self.page_url, content), f"meta:{prop}"))
+        if tag == "link":
+            rel = (attr_map.get("rel") or "").lower()
+            href = attr_map.get("href")
+            if href and any(k in rel for k in ["icon", "apple-touch-icon"]):
+                self.links.append((urljoin(self.page_url, href), f"link:{rel}"))
 
 
 def clean_url(url: str) -> Optional[str]:
@@ -92,12 +97,28 @@ def fetch_html(url: str) -> Optional[str]:
     return None
 
 
+def extract_source_png_links(page_url: str, html: str) -> List[Tuple[str, str]]:
+    # Pull URLs directly from raw source for patterns like institution-logo.png, logo-white.png, etc.
+    pattern = re.compile(r"(https?:\\/\\/[^\"'\s>]+?\.png|\\/[^\"'\s>]+?\.png)", re.IGNORECASE)
+    links: List[Tuple[str, str]] = []
+    for raw in pattern.findall(html):
+        cleaned = raw.replace("\\/", "/")
+        absolute = urljoin(page_url, cleaned)
+        lowered = absolute.lower()
+        if any(k in lowered for k in ["logo", "brand", "header", "navbar"]):
+            links.append((absolute, "source_regex_logo_png"))
+    return links
+
+
 def extract_image_links(page_url: str, html: str) -> List[Tuple[str, str]]:
     parser = ImageExtractor(page_url)
     parser.feed(html)
+
+    all_links = parser.links + extract_source_png_links(page_url, html)
+
     seen = set()
-    out = []
-    for link, desc in parser.links:
+    out: List[Tuple[str, str]] = []
+    for link, desc in all_links:
         if link in seen:
             continue
         seen.add(link)
@@ -116,39 +137,55 @@ def parse_png_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
     return width, height
 
 
-def download_png(url: str) -> Optional[Tuple[bytes, int, int]]:
+def download_png(url: str, enforce_size_limit: bool = True) -> Optional[Tuple[bytes, int, int]]:
     try:
-        data, _ = fetch_url(url)
+        data, ctype = fetch_url(url)
     except Exception:
         return None
-    if len(data) == 0 or len(data) > MAX_IMAGE_SIZE:
+
+    if len(data) == 0:
         return None
+    if enforce_size_limit and len(data) > MAX_IMAGE_SIZE:
+        return None
+
     dims = parse_png_dimensions(data)
     if not dims:
         return None
+
     width, height = dims
     if width < 20 or height < 20:
         return None
+
+    if "png" not in ctype.lower() and not url.lower().endswith(".png"):
+        return None
+
     return data, width, height
 
 
 def score_candidate(url: str, descriptor: str, fi_name: str, source_hint: str) -> float:
-    score = 0.25
+    score = 0.20
     u = url.lower()
     d = descriptor.lower()
     fi = fi_name.lower()
+
+    compact_fi = re.sub(r"[^a-z0-9]", "", fi)
+    compact_url = re.sub(r"[^a-z0-9]", "", u)
+
     if "logo" in u or "logo" in d:
-        score += 0.3
-    if any(k in u for k in ["header", "brand", "navbar"]):
-        score += 0.1
-    if fi and fi.replace(" ", "") in re.sub(r"[^a-z0-9]", "", u):
-        score += 0.1
-    if fi and any(part in d for part in fi.split() if len(part) > 3):
-        score += 0.1
-    if source_hint == "direct_input_url":
+        score += 0.35
+    if any(k in u for k in ["brand", "header", "navbar", "identity"]):
         score += 0.12
+    if compact_fi and compact_fi in compact_url:
+        score += 0.18
+    if fi and any(part in d for part in fi.split() if len(part) > 3):
+        score += 0.12
+    if source_hint.startswith("direct"):
+        score += 0.10
+    if source_hint.startswith("web_search"):
+        score += 0.06
     if u.endswith(".png"):
-        score += 0.08
+        score += 0.07
+
     return min(score, 0.98)
 
 
@@ -158,10 +195,47 @@ def query_duckduckgo(fi_name: str) -> List[str]:
     html = fetch_html(url)
     if not html:
         return []
-    return re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html)[:4]
+    return re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', html)[:5]
 
 
-def scan_targets(targets: List[Tuple[str, str]], fi_name: str, start_time: float) -> List[LogoCandidate]:
+def build_candidates(
+    image_links: List[Tuple[str, str]],
+    fi_name: str,
+    source_label: str,
+    enforce_size_limit: bool,
+    start_time: float,
+) -> List[LogoCandidate]:
+    candidates: List[LogoCandidate] = []
+
+    for image_url, descriptor in image_links:
+        if time.time() - start_time > PROCESS_TIMEOUT:
+            break
+
+        rec = download_png(image_url, enforce_size_limit=enforce_size_limit)
+        if not rec:
+            continue
+
+        data, w, h = rec
+        candidates.append(
+            LogoCandidate(
+                id=str(uuid.uuid4()),
+                source=source_label,
+                image_url=image_url,
+                confidence=round(score_candidate(image_url, descriptor, fi_name, source_label), 2),
+                reason=descriptor[:140] or "image reference",
+                size_bytes=len(data),
+                width=w,
+                height=h,
+                data_b64=base64.b64encode(data).decode("utf-8"),
+            )
+        )
+
+    return candidates
+
+
+def scan_targets(
+    targets: List[Tuple[str, str]], fi_name: str, start_time: float, enforce_size_limit: bool = True
+) -> List[LogoCandidate]:
     candidates: List[LogoCandidate] = []
     for page_url, source_hint in targets:
         if time.time() - start_time > PROCESS_TIMEOUT:
@@ -169,73 +243,81 @@ def scan_targets(targets: List[Tuple[str, str]], fi_name: str, start_time: float
         html = fetch_html(page_url)
         if not html:
             continue
-        for image_url, descriptor in extract_image_links(page_url, html):
-            if time.time() - start_time > PROCESS_TIMEOUT:
-                break
-            rec = download_png(image_url)
-            if not rec:
-                continue
-            data, w, h = rec
-            candidates.append(
-                LogoCandidate(
-                    id=str(uuid.uuid4()),
-                    source=f"{source_hint} ({page_url})",
-                    image_url=image_url,
-                    confidence=round(score_candidate(image_url, descriptor, fi_name, source_hint), 2),
-                    reason=descriptor[:140] or "image reference",
-                    size_bytes=len(data),
-                    width=w,
-                    height=h,
-                    data_b64=base64.b64encode(data).decode("utf-8"),
-                )
-            )
+
+        image_links = extract_image_links(page_url, html)
+        source_label = f"{source_hint} ({page_url})"
+        candidates.extend(build_candidates(image_links, fi_name, source_label, enforce_size_limit, start_time))
+
     return candidates
+
+
+def dedupe_top(candidates: List[LogoCandidate], max_items: int = 3) -> List[LogoCandidate]:
+    candidates.sort(key=lambda x: x.confidence, reverse=True)
+    deduped: List[LogoCandidate] = []
+    seen = set()
+    for c in candidates:
+        if c.image_url in seen:
+            continue
+        seen.add(c.image_url)
+        deduped.append(c)
+        if len(deduped) >= max_items:
+            break
+    return deduped
 
 
 def find_logos(fi_name: str, home_url: Optional[str], login_url: Optional[str]) -> Dict:
     start = time.time()
+
     direct_targets: List[Tuple[str, str]] = []
     if home_url:
         direct_targets.append((home_url, "direct_input_url"))
     if login_url:
         direct_targets.append((login_url, "direct_input_url"))
 
-    all_candidates = scan_targets(direct_targets, fi_name, start)
+    # Pass 1: strict policy (PNG and <=11KB)
+    strict_candidates = scan_targets(direct_targets, fi_name, start, enforce_size_limit=True)
 
-    if len(all_candidates) < 1:
-        search_targets = [(u, "web_search") for u in query_duckduckgo(fi_name)]
-        all_candidates.extend(scan_targets(search_targets, fi_name, start))
+    if len(strict_candidates) < 1:
+        search_targets = [(u, "web_search_page") for u in query_duckduckgo(fi_name)]
+        strict_candidates.extend(scan_targets(search_targets, fi_name, start, enforce_size_limit=True))
 
-    all_candidates.sort(key=lambda x: x.confidence, reverse=True)
+    top_strict = dedupe_top(strict_candidates, max_items=3)
 
-    deduped: List[LogoCandidate] = []
-    seen = set()
-    for c in all_candidates:
-        if c.image_url in seen:
-            continue
-        seen.add(c.image_url)
-        deduped.append(c)
-        if len(deduped) >= 3:
-            break
+    if top_strict:
+        with LOCK:
+            for c in top_strict:
+                RESULT_STORE[c.id] = asdict(c)
+        message = (
+            "Found a high-confidence logo candidate."
+            if top_strict[0].confidence >= 0.85
+            else "I am not 100% sure. Here are up to 3 options with confidence and source."
+        )
+        return {"status": "ok", "message": message, "results": [asdict(c) for c in top_strict]}
 
-    if not deduped:
+    # Pass 2: fallback for better usability if strict constraint yields nothing.
+    # Return first 3 PNGs found from source/search even if >11KB.
+    relaxed_candidates = scan_targets(direct_targets, fi_name, start, enforce_size_limit=False)
+    if len(relaxed_candidates) < 1:
+        search_targets = [(u, "web_search_page") for u in query_duckduckgo(fi_name)]
+        relaxed_candidates.extend(scan_targets(search_targets, fi_name, start, enforce_size_limit=False))
+
+    top_relaxed = dedupe_top(relaxed_candidates, max_items=3)
+
+    if top_relaxed:
+        with LOCK:
+            for c in top_relaxed:
+                RESULT_STORE[c.id] = asdict(c)
         return {
-            "status": "needs_more_details",
-            "message": "I could not confirm the exact logo. Please provide more FI details (legal name/state/official page).",
-            "results": [],
+            "status": "ok",
+            "message": "No PNG <=11KB was found. Returning top 3 PNG logo candidates from page source/web search (may exceed 11KB).",
+            "results": [asdict(c) for c in top_relaxed],
         }
 
-    with LOCK:
-        for c in deduped:
-            RESULT_STORE[c.id] = asdict(c)
-
-    message = (
-        "Found a high-confidence logo candidate."
-        if deduped[0].confidence >= 0.85
-        else "I am not 100% sure. Here are up to 3 options with confidence and source."
-    )
-
-    return {"status": "ok", "message": message, "results": [asdict(c) for c in deduped]}
+    return {
+        "status": "needs_more_details",
+        "message": "I could not confirm the exact logo. Please provide more FI details (legal name/state/official page).",
+        "results": [],
+    }
 
 
 class AppHandler(BaseHTTPRequestHandler):
