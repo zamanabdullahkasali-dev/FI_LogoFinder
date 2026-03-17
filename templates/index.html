@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FI Logo Finder</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg-orb orb-1"></div>
+  <div class="bg-orb orb-2"></div>
+
+  <main class="layout">
+    <section class="panel intro">
+      <h1>FI Logo Finder</h1>
+      <p>Fast logo discovery for U.S. financial institutions with strict constraints: <strong>PNG only</strong>, <strong>&lt;11KB</strong>, response window <strong>≤ 3 minutes</strong>.</p>
+      <ul>
+        <li>1) Try Home/Login URL first.</li>
+        <li>2) Fallback to web search if needed.</li>
+        <li>3) If uncertain, return up to 3 options with confidence + source.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <form id="finderForm">
+        <label>FI Name <span>*</span>
+          <input id="fiName" type="text" placeholder="First Interstate Bank" required />
+        </label>
+        <label>Home URL
+          <input id="homeUrl" type="url" placeholder="https://www.example.com" />
+        </label>
+        <label>Login URL
+          <input id="loginUrl" type="url" placeholder="https://login.example.com" />
+        </label>
+
+        <div class="actions">
+          <button id="submitBtn" type="submit">Find Logo</button>
+          <div id="timer" class="timer">Ready</div>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel results" id="results">
+      <h2>Results</h2>
+      <p class="muted">Run a search to preview logo matches.</p>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
